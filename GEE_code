@@ -1,0 +1,197 @@
+var country = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
+
+var singapore = country.filter(ee.Filter.eq('country_na','Singapore'))
+
+
+var america = ee.FeatureCollection("FAO/GAUL/2015/level2")
+
+var california = america.filter(ee.Filter.eq('ADM2_NAME', 'Los Angeles'))
+
+var roi = singapore
+
+var simplifiedCol = roi.map(function(feature) {
+  return feature.simplify({maxError: 100});
+});
+
+var simplifiedCol_ca = california.map(function(feature) {
+  return feature.simplify({maxError: 100});
+});
+
+var start_year='2016'
+var end_year = start_year
+var date_start=start_year+'-01-01'
+var date_end=start_year+ '-12-31'
+var my_scale=100
+
+var nlcd = ee.ImageCollection('USGS/NLCD_RELEASES/2019_REL/NLCD')
+              .filter(ee.Filter.eq('system:index', '2019'))
+              .filterBounds(simplifiedCol_ca)
+              .select('landcover')
+              .median();
+
+var fromList = [11,
+12,
+21,
+22,
+23,
+24,
+31,
+41,
+42,
+43,
+51,
+52,
+71,
+72,
+73,
+74,
+81,
+82,
+90,
+95];
+var toList = [0,
+1,
+2,
+3,
+4,
+5,
+6,
+7,
+8,
+9,
+10,
+11,
+12,
+13,
+14,
+15,
+16,
+17,
+18,
+19];
+
+var nlcdreclass = nlcd.remap({
+  from: fromList,
+  to: toList,
+  defaultValue: 0,
+  bandName: 'landcover'
+});
+
+var nlcd_final = nlcdreclass
+
+var collection_modis=ee.ImageCollection("MODIS/061/MOD09A1")
+                         .filterDate(date_start,date_end)
+                         .filterBounds(simplifiedCol) 
+                         .median();
+
+
+var qa_band = collection_modis.select('QA').int16();
+var cloud_mask = qa_band.bitwiseAnd(1 << 4).neq(0);
+var masked_image = collection_modis.updateMask(cloud_mask);
+
+
+var modis_img=masked_image.select(['sur_refl_b01', 'sur_refl_b02', 'sur_refl_b03','sur_refl_b04','sur_refl_b07']
+                                   ,['red','nir','blue','green','swir1'])
+
+
+var srtm = ee.Image("USGS/SRTMGL1_003");  
+var dem = ee.Algorithms.Terrain(srtm);  
+var elevation = dem.select("elevation");  
+var slope = dem.select("slope");  
+  
+var modis_bands = [  
+  'red','nir','blue','green','swir1',  
+  "SLOPE", "ELEVATION"  
+];  
+
+var modis_final = modis_img
+                   .addBands(elevation.rename("ELEVATION"))  
+                   .addBands(slope.rename("SLOPE"))  
+                   .select(modis_bands); 
+print(modis_final)
+////////////////////////////////////////////////////////////
+
+var train_modis=ee.ImageCollection("MODIS/061/MOD09A1")
+                         .filterDate(date_start,date_end)
+                         .filterBounds(simplifiedCol_ca) 
+                         .median();
+
+var masked_train = train_modis.updateMask(cloud_mask);
+
+var train_img = masked_train.select(['sur_refl_b01', 'sur_refl_b02', 'sur_refl_b03','sur_refl_b04','sur_refl_b07']
+                                   ,['red','nir','blue','green','swir1'])
+
+var train_final = train_img
+                   .addBands(elevation.rename("ELEVATION"))  
+                   .addBands(slope.rename("SLOPE"))  
+                   .select(modis_bands); 
+
+print(train_final)
+
+var train_final_addband = train_final.addBands(nlcd_final) 
+print(train_final_addband)
+
+var item_sample = train_final_addband.sample({
+                    region: california.geometry().bounds(),
+                    tileScale:16,
+                    numPixels:100000,
+                    scale: my_scale,
+                    geometries: true
+                  }); 
+
+var sampledata=item_sample
+sampledata = sampledata.randomColumn();
+var fea_train = sampledata.filter(ee.Filter.lt('random',0.7));
+print("training point",fea_train.size());
+var fea_test = sampledata.filter(ee.Filter.gte('random',0.7));
+print("validation point",fea_test.size());
+
+var classifier = ee.Classifier.smileRandomForest(80).train({ //
+  features: fea_train,   
+  classProperty: 'remapped',  
+  inputProperties: modis_bands
+  }); 
+
+var classified = modis_final.classify(classifier)
+
+
+var validated = fea_test.classify(classifier);
+var testAccuracy = validated.errorMatrix("remapped","classification");
+print("erromatrix",testAccuracy)
+print("accuracy",testAccuracy.accuracy())
+print("kappa",testAccuracy.kappa())
+print('producersAccuracy:', testAccuracy.producersAccuracy())
+
+var classified_vis = classified.clipToCollection(roi)
+
+var igbpLandCoverVis = {
+  min: 0.0,
+  max: 19.0,
+  palette: [
+ '466b9f',
+'d1def8',
+'dec5c5',
+'d99282',
+'FF4F4F',
+'ab0000',
+'b3ac9f',
+'68ab5f',
+'1c5f2c',
+'b5c58f',
+'af963c',
+'ccb879',
+'dfdfc2',
+'d1d182',
+'a3cc51',
+'82ba9e',
+'dcd939',
+'ab6c28',
+'b8d9eb',
+'6c9fb8',
+  ],
+};
+
+Map.centerObject(roi,10)
+Map.addLayer(classified_vis,igbpLandCoverVis,"classification")
+
+
